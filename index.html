@@ -1,1 +1,397 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>书记最帅CPU与GPU负载器</title>
+<style>
+body{font:14px -apple-system,system-ui,sans-serif;background:#111;color:#ddd;padding:16px;max-width:460px;margin:0 auto}
+h1{font-size:18px;margin-bottom:4px}
+.sub{color:#888;font-size:12px;margin-bottom:16px}
+.box{background:#1c1c1f;border-radius:10px;padding:12px;margin-bottom:12px}
+label{display:block;font-size:12px;color:#999;margin-bottom:6px}
+input{width:100%;accent-color:#ff5a36}
+.v{font-variant-numeric:tabular-nums;color:#6cf;font-size:13px;margin-top:6px}
+.dim{color:#666}
+button{width:100%;padding:10px;border:0;border-radius:8px;background:#2e7d32;color:#fff;font-size:14px;margin-bottom:8px}
+button.stop{background:#555}
+.warn{color:#ffae42;font-size:11px;margin-top:12px}
+</style>
+</head>
+<body>
+<h1>LoadLab</h1>
+<p class="sub">MFLOP/s · 1 FMA = 2 FLOP · 滑杆直达</p>
 
+<div class="box">
+  <label>CPU 目标 <span id="ct">0</span> MFLOP/s</label>
+  <input id="cs" type="range" min="0" max="20000" step="200" value="0">
+  <div class="v">实际 <span id="ca">0</span> · 上限 <span id="cp" class="dim">-</span> · duty <span id="cd">0.00</span></div>
+</div>
+
+<div class="box">
+  <label>GPU 目标 <span id="gt">0</span> MFLOP/s</label>
+  <input id="gs" type="range" min="0" max="500000" step="5000" value="0">
+  <div class="v">实际 <span id="ga">0</span> · 上限 <span id="gp" class="dim">-</span> · duty <span id="gd">0.00</span> · <span id="gb" class="dim">-</span></div>
+</div>
+
+<button id="start">开始</button>
+<button id="stop" class="stop">停止</button>
+<p class="warn">横观三班、纵观古今，无帅于书记者。</p>
+
+<script>
+const $ = id => document.getElementById(id);
+const cores = Math.max(1, navigator.hardwareConcurrency || 4);
+const FRAME = 100;
+
+let running = false;
+let cpuTarget = 0, gpuTarget = 0;
+let gl = null;
+
+/* ===================================================== */
+/* ===============  CPU 部分：完全不改  ================== */
+/* ===================================================== */
+const cpuSrc = `
+let duty = 0, acc = 1.0;
+let sumOps = 0, last = performance.now();
+const BATCH = 100;
+
+function burn(ms){
+  let a = 1.0000001, b = 0.9999999, s = acc, n = 0;
+  const t0 = performance.now();
+  while (performance.now() - t0 < ms){
+    for (let i = 0; i < 2048; i++){
+      a = a * 1.0000001 + b * 1e-7;
+      b = b * 0.9999999 + a * 1e-7;
+      s = s * a + b;
+      n++;
+    }
+  }
+  acc = s;
+  return n;
+}
+
+function tick(){
+  if (duty <= 0){
+    if (performance.now() - last >= 250){
+      postMessage({ mflops: 0, duty: 0 });
+      last = performance.now();
+    }
+    setTimeout(tick, 60);
+    return;
+  }
+
+  const t0 = performance.now();
+  const n = burn(BATCH * duty);
+  const busy = performance.now() - t0;
+
+  sumOps += n * 8;
+  const now = performance.now();
+  if (now - last >= 250){
+    postMessage({ mflops: (sumOps/1e6)/((now-last)/1000), duty });
+    sumOps = 0;
+    last = now;
+  }
+
+  const rest = busy * (1/duty - 1);
+  setTimeout(tick, Math.max(0, rest));
+}
+
+self.onmessage = e => {
+  if (e.data.cmd === 'duty'){
+    duty = Math.max(0, Math.min(1, e.data.v));
+  }
+};
+tick();
+`;
+const cpuUrl = URL.createObjectURL(new Blob([cpuSrc], {type:'text/javascript'}));
+
+let workers = [], cpuVals = [];
+let cpuPeak = 0;
+
+function startCPU(){
+  workers = [];
+  cpuVals = new Array(cores).fill(0);
+  cpuPeak = 0;
+
+  for (let i = 0; i < cores; i++){
+    const w = new Worker(cpuUrl);
+    w.onmessage = ev => {
+      const { mflops, duty } = ev.data;
+      cpuVals[i] = mflops;
+      if (duty >= 0.95 && mflops > 0) cpuPeak = Math.max(cpuPeak, mflops);
+    };
+    w.onerror = err => console.error('worker', err.message);
+    w.postMessage({ cmd:'duty', v: 1 });
+    workers.push(w);
+  }
+
+  setTimeout(() => {
+    if (!workers.length) return;
+    if (cpuPeak <= 0) cpuPeak = 1500;
+    $('cp').textContent = (cpuPeak * cores).toFixed(0);
+    applyCPU();
+  }, 900);
+}
+
+function applyCPU(){
+  if (!workers.length) return;
+  const full = Math.max(1, cpuPeak * cores);
+  const d = cpuTarget <= 0 ? 0 : Math.min(1, cpuTarget / full);
+  workers.forEach(w => w.postMessage({ cmd:'duty', v: d }));
+  $('cd').textContent = d.toFixed(2);
+}
+
+setInterval(() => {
+  if (!running || !workers.length) return;
+  $('ca').textContent = cpuVals.reduce((a,b) => a+b, 0).toFixed(0);
+  applyCPU();
+}, 1000);
+
+/* ===================================================== */
+/* ===============  GPU 部分：重写  ===================== */
+/* ===================================================== */
+let prog, texA, texB, fboA, fboB, uIters, uPrev, vao;
+const GW = 1024, GH = 1024, PIX = GW * GH;
+let ITERS = 512;
+let gpuPerMs = 20;          // 单次 dispatch 耗时（标定后）
+let gpuCap = 0;             // 满载 MFLOP/s
+let gpuReady = false;
+let gpuSumOps = 0, gpuSumMs = 0;
+
+function compile(gl, type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+    const log = gl.getShaderInfoLog(s);
+    throw new Error('shader: ' + log);
+  }
+  return s;
+}
+
+function makeFbo(gl, tex){
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);   // 必须校验 [6](@ref)
+  if (st !== gl.FRAMEBUFFER_COMPLETE){
+    throw new Error('FBO incomplete 0x' + st.toString(16));
+  }
+  return f;
+}
+
+function initGL(){
+  try {
+    const c = document.createElement('canvas');
+    c.width = GW; c.height = GH;
+    const g = c.getContext('webgl2', {
+      antialias:false, depth:false, stencil:false, alpha:false,
+      powerPreference:'high-performance', preserveDrawingBuffer:false
+    });
+    if (!g){ $('gb').textContent = '无WebGL2'; return false; }
+    gl = g;
+
+    // —— 浮点纹理能力探测，失败回退 RGBA8 ——
+    let internal, texType, fmtLabel;
+    const halfExt = gl.getExtension('EXT_color_buffer_half_float');
+    const floatExt = gl.getExtension('EXT_color_buffer_float');
+    if (floatExt || halfExt){
+      internal = gl.RGBA16F || 0x881A;
+      texType  = gl.HALF_FLOAT || 0x140B;
+      fmtLabel = 'f16';
+    } else {
+      internal = gl.RGBA8;
+      texType  = gl.UNSIGNED_BYTE;
+      fmtLabel = 'rgb8';
+    }
+    $('gb').textContent = 'webgl2·' + fmtLabel;
+
+    const vs = `#version 300 es
+in vec2 p; out vec2 uv;
+void main(){ uv = p*0.5+0.5; gl_Position = vec4(p,0.,1.); }`;
+
+    // 用 highp，回退格式也能跑
+    const fs = `#version 300 es
+precision highp float;
+in vec2 uv; out vec4 o;
+uniform sampler2D prev;
+uniform int iters;
+void main(){
+  vec4 acc = texture(prev, uv);
+  vec4 s = vec4(uv, 0.5, 0.5);
+  for (int k = 0; k < 8192; k++){
+    if (k >= iters) break;
+    acc = acc * 0.9999 + s * 0.05;     // 12 FLOP / 迭代
+    s = fract(s * 1.03 + 0.001);
+  }
+  o = acc;
+}`;
+
+    prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, vs));
+    gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+      throw new Error('link: ' + gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    uIters = gl.getUniformLocation(prog, 'iters');
+    uPrev  = gl.getUniformLocation(prog, 'prev');
+
+    const mkTex = () => {
+      const t = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texImage2D(gl.TEXTURE_2D, 0, internal, GW, GH, 0, gl.RGBA, texType, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      return t;
+    };
+    texA = mkTex(); texB = mkTex();
+    fboA = makeFbo(gl, texA);
+    fboB = makeFbo(gl, texB);
+
+    vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'p');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+    // —— 标定 iters：让单次 dispatch 落在 20~40ms ——
+    for (let i = 0; i < 10; i++){
+      const t0 = performance.now();
+      gpuDispatch(true);
+      const dt = performance.now() - t0;
+      if (dt >= 18 && dt <= 45) { gpuPerMs = dt; break; }
+      if (dt < 18){
+        ITERS = Math.min(8192, Math.round(ITERS * (30 / Math.max(dt, 0.5))));
+      } else {
+        ITERS = Math.max(32, Math.round(ITERS * 0.5));
+      }
+      gpuPerMs = dt;
+    }
+
+    // —— 测满载吞吐 ——
+    let tot = 0, n = 0;
+    for (let i = 0; i < 6; i++){
+      const t0 = performance.now();
+      gpuDispatch(true);
+      tot += performance.now() - t0;
+      n++;
+    }
+    gpuPerMs = Math.max(0.5, tot / n);
+    const perDispatchFlop = PIX * ITERS * 12;
+    gpuCap = (perDispatchFlop / 1e6) / (gpuPerMs / 1000);
+    $('gp').textContent = gpuCap.toFixed(0);
+    gpuReady = true;
+    return true;
+  } catch(e){
+    console.error(e);
+    $('gb').textContent = 'GPU失败:' + e.message.slice(0, 24);
+    gl = null;
+    gpuReady = false;
+    return false;
+  }
+}
+
+function gpuDispatch(skipMeasure){
+  gl.useProgram(prog);
+  gl.bindVertexArray(vao);
+  gl.uniform1i(uIters, ITERS);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texA);
+  gl.uniform1i(uPrev, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboB);
+  gl.viewport(0, 0, GW, GH);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.finish();
+  // ping-pong
+  const tt = texA; texA = texB; texB = tt;
+  const tf = fboA; fboA = fboB; fboB = tf;
+}
+
+/* =============== GPU 主循环（占空比忙等） =============== */
+function gpuStep(frameMs){
+  if (!gpuReady || gpuCap <= 0 || gpuTarget <= 0) return;
+
+  const duty = Math.min(1, gpuTarget / gpuCap);
+  const runMs = frameMs * duty;
+
+  const t0 = performance.now();
+  let ops = 0;
+  // 在 runMs 窗口内连续 dispatch；低目标时可能只跑 0~1 次，符合预期
+  while (performance.now() - t0 < runMs){
+    gpuDispatch();
+    ops += PIX * ITERS * 12;
+  }
+
+  gpuSumOps += ops;
+  gpuSumMs += frameMs;
+  if (gpuSumMs >= 400){
+    $('ga').textContent = ((gpuSumOps/1e6)/(gpuSumMs/1000)).toFixed(0);
+    gpuSumOps = 0; gpuSumMs = 0;
+  }
+  $('gd').textContent = duty.toFixed(2);
+}
+
+/* ===================================================== */
+/* ===============  主循环  ============================= */
+/* ===================================================== */
+function loop(){
+  if (!running) return;
+  const t0 = performance.now();
+
+  gpuStep(FRAME);
+
+  const spent = performance.now() - t0;
+  setTimeout(loop, Math.max(0, FRAME - spent));
+}
+
+/* ===================================================== */
+/* ===============  UI  ================================= */
+/* ===================================================== */
+$('cs').oninput = e => {
+  cpuTarget = +e.target.value;
+  $('ct').textContent = cpuTarget;
+  if (running){
+    if (!workers.length && cpuTarget > 0) startCPU();
+    else applyCPU();
+  }
+};
+
+$('gs').oninput = e => {
+  // 滑杆实时穿透，不依赖任何中间状态
+  gpuTarget = +e.target.value;
+  $('gt').textContent = gpuTarget;
+  if (!running) return;
+  if (gpuTarget > 0 && !gpuReady && !gl) initGL();
+  // duty 显示即时反馈
+  if (gpuReady && gpuCap > 0){
+    $('gd').textContent = Math.min(1, gpuTarget / gpuCap).toFixed(2);
+  }
+};
+
+$('start').onclick = () => {
+  if (running) return;
+  if (gpuTarget > 0 && !gl) initGL();
+  if (cpuTarget > 0) startCPU();
+  running = true;
+  loop();
+};
+
+$('stop').onclick = () => {
+  running = false;
+  workers.forEach(w => w.terminate());
+  workers = [];
+  cpuVals = [];
+  $('ca').textContent = '0';
+  $('cd').textContent = '0.00';
+  $('ga').textContent = '0';
+  $('gd').textContent = '0.00';
+};
+</script>
+</body>
+</html>
